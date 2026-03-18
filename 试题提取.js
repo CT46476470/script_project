@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         试题截图器 + API 批量提取（URL自动解析参数）
+// @name         试题截图器 + 自动上传 (无下载版)
 // @namespace    http://tampermonkey.net/
-// @version      6.0
-// @description  支持从页面URL自动获取接口参数，批量获取题目并截图，修复0KB问题
+// @version      8.0
+// @description  支持从页面URL自动获取接口参数，批量获取题目、截图并直接上传到图床
 // @author       You
 // @match        *://zujuan.xkw.com/*
 // @grant        GM_xmlhttpRequest
@@ -13,10 +13,53 @@
 (function() {
     'use strict';
 
+    // ===================== 1. 上传配置 (从脚本2复制) =====================
+    const UPLOAD_CONFIG = {
+        url: "https://vmzuhzwrsucrdgcbjywy.supabase.co/functions/v1/upload-to-catbox",
+        method: "POST"
+    };
+
     // ---------- 全局变量 ----------
     let exportData = [];
     let isProcessing = false;
     let referenceWidth = null;
+
+    // ===================== 2. 上传工具函数 (从脚本2复制) =====================
+
+    // DataURL 转 File 对象
+    async function dataUrlToFile(dataUrl, fileName = `dataurl_${Date.now()}.png`) {
+        const response = await fetch(dataUrl);
+        const blob = await response.blob();
+        return new File([blob], fileName, { type: blob.type });
+    }
+
+    // 统一上传函数 (改为 Promise 形式以支持 await)
+    function uploadImage(file) {
+        return new Promise((resolve) => {
+            const formData = new FormData();
+            formData.append('file', file);
+            GM_xmlhttpRequest({
+                method: UPLOAD_CONFIG.method,
+                url: UPLOAD_CONFIG.url,
+                data: formData,
+                timeout: 30000,
+                onload: (res) => {
+                    try {
+                        const result = JSON.parse(res.responseText);
+                        if (res.status === 200 && result.url) {
+                            resolve({ success: true, url: result.url });
+                        } else {
+                            resolve({ success: false, msg: result.msg || '接口异常' });
+                        }
+                    } catch (err) {
+                        resolve({ success: false, msg: '解析响应失败' });
+                    }
+                },
+                onerror: () => resolve({ success: false, msg: '网络错误' }),
+                ontimeout: () => resolve({ success: false, msg: '上传超时' })
+            });
+        });
+    }
 
     // ---------- 【核心】从URL自动解析参数 ----------
     function parseParamsFromUrl() {
@@ -31,19 +74,12 @@
             curPage: "2"
         };
 
-        // 解析 zsd + 数字 → categoryId
         const zsdMatch = url.match(/zsd(\d+)/);
         if (zsdMatch) params.categoryId = zsdMatch[1];
-
-        // 解析 qt + 数字 → quesType
         const qtMatch = url.match(/qt(\d+)/);
         if (qtMatch) params.quesType = qtMatch[1];
-
-        // 解析 pt + 数字 → paperTypeId
         const ptMatch = url.match(/pt(\d+)/);
         if (ptMatch) params.paperTypeId = ptMatch[1];
-
-        // 解析 p + 数字 → curPage
         const pMatch = url.match(/p(\d+)/);
         if (pMatch) params.curPage = pMatch[1];
 
@@ -70,14 +106,14 @@
     `;
 
     const btnDom = document.createElement('button');
-    btnDom.textContent = '📸 截图当前页面';
+    btnDom.textContent = '📸 截图当前页面(直传)';
     btnDom.style.cssText = `padding: 8px;background: #4CAF50;color: white;border: none;border-radius: 4px;cursor: pointer;font-weight: bold;`;
     btnDom.addEventListener('click', captureDomElements);
 
     const apiSection = document.createElement('div');
     apiSection.style.cssText = `border-top: 1px solid #ccc;padding-top: 10px;display: flex;flex-direction: column;gap: 8px;`;
     const apiTitle = document.createElement('div');
-    apiTitle.textContent = '🔌 API 批量提取（自动读取URL参数）';
+    apiTitle.textContent = '🔌 API 批量提取 (直传版)';
     apiTitle.style.fontWeight = 'bold';
 
     const limitRow = document.createElement('div');
@@ -87,7 +123,7 @@
     limitRow.innerHTML = `<span style="white-space: nowrap;">提取数量:</span><input type="number" id="apiLimit" min="1" placeholder="留空=全部" style="width:100px; padding:4px;">`;
 
     const btnApi = document.createElement('button');
-    btnApi.textContent = '📥 开始从API提取';
+    btnApi.textContent = '📥 开始(截图+上传)';
     btnApi.style.cssText = `padding: 8px;background: #2196F3;color: white;border: none;border-radius: 4px;cursor: pointer;font-weight: bold;`;
 
     const progressDiv = document.createElement('div');
@@ -95,7 +131,7 @@
     progressDiv.id = 'apiProgress';
 
     const btnExportNow = document.createElement('button');
-    btnExportNow.textContent = '📋 导出当前CSV';
+    btnExportNow.textContent = '📋 导出CSV(含链接)';
     btnExportNow.style.cssText = `padding: 6px;background: #FF9800;color: white;border: none;border-radius: 4px;cursor: pointer;font-size: 12px;`;
     btnExportNow.disabled = true;
     btnExportNow.addEventListener('click', () => {
@@ -118,7 +154,7 @@
         info.content = contentDiv ? contentDiv.innerText.trim().replace(/\s+/g, ' ') : '';
         const srcLink = container.querySelector('.ques-src');
         info.source = srcLink ? srcLink.innerText.trim() : '';
-        info.screenshotFile = '';
+        info.screenshotUrl = ''; // 这里现在存上传后的URL
         return info;
     }
 
@@ -150,22 +186,22 @@
     // ---------- 工具函数：导出CSV ----------
     function exportToCSV(data, filename = null) {
         if (!data.length) return;
-        const headers = ['题目ID', '题目类型', '难度', '知识点', '题目内容', '来源', '截图文件名'];
+        const headers = ['题目ID', '题目类型', '难度', '知识点', '题目内容', '来源', '截图链接'];
         const csvRows = data.map(item => [
-            item.id, item.type, item.difficulty, item.knowledge, item.content, item.source, item.screenshotFile
+            item.id, item.type, item.difficulty, item.knowledge, item.content, item.source, item.screenshotUrl
         ].map(field => {
             const str = String(field ?? '');
             return /[,"\n\r]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
         }).join(','));
         const blob = new Blob(['\uFEFF' + [headers.join(','), ...csvRows].join('\n')], {type: 'text/csv;charset=utf-8;'});
         const a = document.createElement('a');
-        a.href = 网站.createObjectURL(blob);
+        a.href = URL.createObjectURL(blob);
         a.download = filename || `试题列表_${new Date().toISOString().slice(0,10)}.csv`;
         a.click();
-        网站.revokeObjectURL(a.href);
+        URL.revokeObjectURL(a.href);
     }
 
-    // ---------- 核心处理函数：处理试题 ----------
+    // ---------- 核心处理函数：处理试题 (修改了这里) ----------
     async function processQuestionElements(questions, startIndex, total) {
         const refWidth = getReferenceWidth();
         for (let i = 0; i < questions.length && isProcessing; i++) {
@@ -184,12 +220,27 @@
                 const canvas = await html2canvas(clone, {scale:2, backgroundColor:'#fff', useCORS:true, allowTaint:false});
                 if (canvas.width && canvas.height) {
                     const fileName = `question_${info.id}.png`;
-                    const link = document.createElement('a');
-                    link.download = fileName;
-                    link.href = canvas.toDataURL('image/png');
-                    link.click();
-                    info.screenshotFile = fileName;
-                    exportData.push(info);
+
+                    // 1. 获取 DataURL
+                    const dataUrl = canvas.toDataURL('image/png');
+
+                    // 2. 转换为 File 对象
+                    const file = await dataUrlToFile(dataUrl, fileName);
+
+                    // 3. 直接上传 (不再点击下载)
+                    progressDiv.innerText = `进度：${i+1} / ${total} (正在上传...)`;
+                    const uploadRes = await uploadImage(file);
+
+                    if (uploadRes.success) {
+                        info.screenshotUrl = uploadRes.url; // 保存链接
+                        exportData.push(info);
+                        console.log(`✅ [${fileName}] 上传成功: ${uploadRes.url}`);
+                    } else {
+                        info.screenshotUrl = `上传失败: ${uploadRes.msg}`;
+                        exportData.push(info); // 即使失败也记录，方便排查
+                        console.error(`❌ [${fileName}] 上传失败: ${uploadRes.msg}`);
+                    }
+
                     updateProgress(exportData.length, total);
                 }
             } catch (e) {
@@ -197,11 +248,11 @@
             } finally {
                 wrapper.remove();
             }
-            await new Promise(r => setTimeout(r, 300));
+            await new Promise(r => setTimeout(r, 200)); // 稍微减少间隔
         }
     }
 
-    // ---------- API 请求函数（使用URL解析参数） ----------
+    // ---------- API 请求函数 ----------
     async function fetchQuestionsFromApi(limit = null) {
         const urlParams = parseParamsFromUrl();
         const baseParams = {
